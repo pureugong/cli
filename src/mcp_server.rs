@@ -171,10 +171,7 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
         );
         eprintln!("[gws mcp] Tool mode: {:?}", config.tool_mode);
         if !config.tool_filter.is_empty() {
-            eprintln!(
-                "[gws mcp] Tool filter: {}",
-                config.tool_filter.join(", ")
-            );
+            eprintln!("[gws mcp] Tool filter: {}", config.tool_filter.join(", "));
         }
     }
 
@@ -346,11 +343,7 @@ fn apply_tool_filter(all_tools: &[Value], filter: &[String]) -> Vec<Value> {
 }
 
 /// Apply cursor-based pagination to a tools list.
-fn paginate_tools(
-    tools: &[Value],
-    params: &Value,
-    page_size: usize,
-) -> Result<Value, GwsError> {
+fn paginate_tools(tools: &[Value], params: &Value, page_size: usize) -> Result<Value, GwsError> {
     if page_size == 0 {
         return Ok(json!({ "tools": tools }));
     }
@@ -791,7 +784,10 @@ async fn handle_discover(arguments: &Value, config: &ServerConfig) -> Result<Val
 }
 
 /// Handle `tool_search` — searches the full tool catalog by keyword/service.
-fn handle_tool_search(arguments: &Value, tools_cache: &Option<Vec<Value>>) -> Result<Value, GwsError> {
+fn handle_tool_search(
+    arguments: &Value,
+    tools_cache: &Option<Vec<Value>>,
+) -> Result<Value, GwsError> {
     let query = arguments
         .get("query")
         .and_then(|v| v.as_str())
@@ -828,8 +824,7 @@ fn handle_tool_search(arguments: &Value, tools_cache: &Option<Vec<Value>>) -> Re
                 return service_filter.is_some();
             }
             let desc = tool["description"].as_str().unwrap_or("");
-            name.to_lowercase().contains(&query_lower)
-                || desc.to_lowercase().contains(&query_lower)
+            name.to_lowercase().contains(&query_lower) || desc.to_lowercase().contains(&query_lower)
         })
         .take(20)
         .collect();
@@ -1354,15 +1349,25 @@ mod tests {
         walk_resources("drive", &doc.resources, &mut tools);
 
         for tool in &tools {
-            assert!(tool.get("annotations").is_some(), "Tool {} missing annotations", tool["name"]);
+            assert!(
+                tool.get("annotations").is_some(),
+                "Tool {} missing annotations",
+                tool["name"]
+            );
         }
 
         // Check GET method has readOnlyHint
-        let get_tool = tools.iter().find(|t| t["name"] == "drive_files_get").unwrap();
+        let get_tool = tools
+            .iter()
+            .find(|t| t["name"] == "drive_files_get")
+            .unwrap();
         assert_eq!(get_tool["annotations"]["readOnlyHint"], true);
 
         // Check DELETE method has destructiveHint
-        let del_tool = tools.iter().find(|t| t["name"] == "drive_files_delete").unwrap();
+        let del_tool = tools
+            .iter()
+            .find(|t| t["name"] == "drive_files_delete")
+            .unwrap();
         assert_eq!(del_tool["annotations"]["destructiveHint"], true);
     }
 
@@ -1403,7 +1408,11 @@ mod tests {
             .collect();
         // All results should be gmail tools
         for name in &tool_names {
-            assert!(name.starts_with("gmail_"), "Expected gmail tool, got {}", name);
+            assert!(
+                name.starts_with("gmail_"),
+                "Expected gmail tool, got {}",
+                name
+            );
         }
     }
 
@@ -1517,7 +1526,10 @@ mod tests {
         let params = json!({"cursor": cursor});
         let result = paginate_tools(&tools, &params, 3);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("exceeds tool count"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds tool count"));
     }
 
     // -- find_resource tests --
@@ -1712,7 +1724,11 @@ mod tests {
         let mut tools = Vec::new();
         append_workflow_tools(&mut tools);
         for tool in &tools {
-            assert!(tool.get("annotations").is_some(), "Tool {} missing annotations", tool["name"]);
+            assert!(
+                tool.get("annotations").is_some(),
+                "Tool {} missing annotations",
+                tool["name"]
+            );
         }
         // Read-only workflows
         assert_eq!(tools[0]["annotations"]["readOnlyHint"], true);
