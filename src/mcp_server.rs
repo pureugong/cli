@@ -18,6 +18,8 @@
 use crate::discovery::RestResource;
 use crate::error::GwsError;
 use crate::services;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use clap::{Arg, Command};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -35,6 +37,8 @@ struct ServerConfig {
     workflows: bool,
     _helpers: bool,
     tool_mode: ToolMode,
+    tool_filter: Vec<String>,
+    page_size: usize,
 }
 
 fn build_mcp_cli() -> Command {
@@ -68,6 +72,48 @@ fn build_mcp_cli() -> Command {
                 .default_value("full")
                 .help("Tool granularity: 'compact' (1 tool/service + discover) or 'full' (1 tool/method)"),
         )
+        .arg(
+            Arg::new("tool-filter")
+                .long("tool-filter")
+                .short('f')
+                .help("Tool filter: 'deferred' (only tool_search), service names, or tool names (comma-separated)")
+                .default_value(""),
+        )
+        .arg(
+            Arg::new("page-size")
+                .long("page-size")
+                .value_parser(clap::value_parser!(usize))
+                .default_value("0")
+                .help("Max tools per tools/list page (0 = no pagination)"),
+        )
+}
+
+fn read_only_annotation(title: &str) -> Value {
+    json!({
+        "title": title,
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+    })
+}
+
+fn mutation_annotation(title: &str, destructive: bool) -> Value {
+    json!({
+        "title": title,
+        "readOnlyHint": false,
+        "destructiveHint": destructive,
+        "idempotentHint": false,
+        "openWorldHint": false
+    })
+}
+
+fn annotation_for_http_method(http_method: &str, tool_name: &str) -> Value {
+    match http_method {
+        "GET" => read_only_annotation(tool_name),
+        "DELETE" => mutation_annotation(tool_name, true),
+        _ => mutation_annotation(tool_name, false),
+    }
 }
 
 pub async fn start(args: &[String]) -> Result<(), GwsError> {
@@ -77,11 +123,29 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
         Some("compact") => ToolMode::Compact,
         _ => ToolMode::Full,
     };
+
+    let filter_str = matches
+        .get_one::<String>("tool-filter")
+        .unwrap()
+        .to_string();
+    let tool_filter: Vec<String> = if filter_str.is_empty() {
+        Vec::new()
+    } else {
+        filter_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect()
+    };
+
+    let page_size = *matches.get_one::<usize>("page-size").unwrap();
+
     let mut config = ServerConfig {
         services: Vec::new(),
         workflows: matches.get_flag("workflows"),
         _helpers: matches.get_flag("helpers"),
         tool_mode,
+        tool_filter,
+        page_size,
     };
 
     let svc_str = matches.get_one::<String>("services").unwrap();
@@ -106,6 +170,12 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
             config.services.join(", ")
         );
         eprintln!("[gws mcp] Tool mode: {:?}", config.tool_mode);
+        if !config.tool_filter.is_empty() {
+            eprintln!(
+                "[gws mcp] Tool filter: {}",
+                config.tool_filter.join(", ")
+            );
+        }
     }
 
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
@@ -197,7 +267,9 @@ async fn handle_request(
                 "version": env!("CARGO_PKG_VERSION")
             },
             "capabilities": {
-                "tools": {}
+                "tools": {
+                    "listChanged": true
+                }
             }
         })),
         "notifications/initialized" => {
@@ -208,15 +280,19 @@ async fn handle_request(
             if tools_cache.is_none() {
                 *tools_cache = Some(build_tools_list(config).await?);
             }
-            Ok(json!({
-                "tools": tools_cache.as_ref().unwrap()
-            }))
+            let all_tools = tools_cache.as_ref().unwrap();
+
+            // Apply tool filter
+            let filtered = apply_tool_filter(all_tools, &config.tool_filter);
+
+            // Apply pagination
+            paginate_tools(&filtered, params, config.page_size)
         }
         "tools/call" => {
             // MCP spec: tool execution errors should be returned as successful results
             // with isError: true, NOT as JSON-RPC protocol errors. Returning JSON-RPC
             // errors causes clients to show generic "Tool execution failed" with no detail.
-            match handle_tools_call(params, config).await {
+            match handle_tools_call(params, config, tools_cache).await {
                 Ok(val) => Ok(val),
                 Err(e) => Ok(json!({
                     "content": [{ "type": "text", "text": e.to_string() }],
@@ -231,12 +307,118 @@ async fn handle_request(
     }
 }
 
+/// Apply tool filter to determine which tools are exposed in tools/list.
+/// The `tool_search` tool is always included when a filter is active.
+fn apply_tool_filter(all_tools: &[Value], filter: &[String]) -> Vec<Value> {
+    if filter.is_empty() {
+        return all_tools.to_vec();
+    }
+
+    let is_deferred = filter.len() == 1 && filter[0] == "deferred";
+
+    // Always include tool_search and gws_discover as meta-tools
+    let meta_tools: Vec<&str> = vec!["tool_search", "gws_discover"];
+
+    let mut result: Vec<Value> = all_tools
+        .iter()
+        .filter(|tool| {
+            let name = tool["name"].as_str().unwrap_or("");
+            if meta_tools.contains(&name) {
+                return true;
+            }
+            if is_deferred {
+                return false;
+            }
+            // Filter by service name prefix or exact tool name
+            filter
+                .iter()
+                .any(|f| name.starts_with(&format!("{}_", f)) || name == f.as_str())
+        })
+        .cloned()
+        .collect();
+
+    // Ensure tool_search is present even if not in the built tools list
+    if !result.iter().any(|t| t["name"] == "tool_search") {
+        result.insert(0, build_tool_search_definition());
+    }
+
+    result
+}
+
+/// Apply cursor-based pagination to a tools list.
+fn paginate_tools(
+    tools: &[Value],
+    params: &Value,
+    page_size: usize,
+) -> Result<Value, GwsError> {
+    if page_size == 0 {
+        return Ok(json!({ "tools": tools }));
+    }
+
+    let start = if let Some(cursor) = params.get("cursor").and_then(|c| c.as_str()) {
+        let decoded = BASE64
+            .decode(cursor)
+            .map_err(|_| GwsError::Validation("Invalid cursor encoding".to_string()))?;
+        let offset_str = String::from_utf8(decoded)
+            .map_err(|_| GwsError::Validation("Invalid cursor encoding".to_string()))?;
+        offset_str
+            .parse::<usize>()
+            .map_err(|_| GwsError::Validation("Invalid cursor value".to_string()))?
+    } else {
+        0
+    };
+
+    if start > tools.len() {
+        return Err(GwsError::Validation(format!(
+            "Cursor offset {} exceeds tool count {}",
+            start,
+            tools.len()
+        )));
+    }
+
+    let end = (start + page_size).min(tools.len());
+    let page = &tools[start..end];
+
+    let mut result = json!({ "tools": page });
+    if end < tools.len() {
+        let next_cursor = BASE64.encode(end.to_string().as_bytes());
+        result["nextCursor"] = json!(next_cursor);
+    }
+
+    Ok(result)
+}
+
+fn build_tool_search_definition() -> Value {
+    json!({
+        "name": "tool_search",
+        "description": "Search for available tools by keyword or service name. Returns matching tools with full schemas. Use this to discover tools before calling them.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Keyword to search tool names and descriptions"
+                },
+                "service": {
+                    "type": "string",
+                    "description": "Filter by service name (e.g., drive, gmail)"
+                }
+            },
+            "required": ["query"]
+        },
+        "annotations": read_only_annotation("Tool Search")
+    })
+}
+
 async fn build_tools_list(config: &ServerConfig) -> Result<Vec<Value>, GwsError> {
     if config.tool_mode == ToolMode::Compact {
         return build_compact_tools_list(config).await;
     }
 
     let mut tools = Vec::new();
+
+    // Always add tool_search meta-tool first
+    tools.push(build_tool_search_definition());
 
     // 1. Walk core services
     for svc_name in &config.services {
@@ -259,6 +441,9 @@ async fn build_tools_list(config: &ServerConfig) -> Result<Vec<Value>, GwsError>
 
 async fn build_compact_tools_list(config: &ServerConfig) -> Result<Vec<Value>, GwsError> {
     let mut tools = Vec::new();
+
+    // Always add tool_search meta-tool first
+    tools.push(build_tool_search_definition());
 
     for svc_name in &config.services {
         let (api_name, version) =
@@ -321,7 +506,8 @@ async fn build_compact_tools_list(config: &ServerConfig) -> Result<Vec<Value>, G
                     }
                 },
                 "required": ["resource", "method"]
-            }
+            },
+            "annotations": mutation_annotation(svc_name, false)
         }));
     }
 
@@ -346,7 +532,8 @@ async fn build_compact_tools_list(config: &ServerConfig) -> Result<Vec<Value>, G
                 }
             },
             "required": ["service"]
-        }
+        },
+        "annotations": read_only_annotation("Discover API Schema")
     }));
 
     // Workflows (same as full mode)
@@ -366,7 +553,8 @@ fn append_workflow_tools(tools: &mut Vec<Value>) {
             "properties": {
                 "format": { "type": "string", "description": "Output format: json, table, yaml, csv" }
             }
-        }
+        },
+        "annotations": read_only_annotation("Standup Report")
     }));
     tools.push(json!({
         "name": "workflow_meeting_prep",
@@ -376,7 +564,8 @@ fn append_workflow_tools(tools: &mut Vec<Value>) {
             "properties": {
                 "calendar": { "type": "string", "description": "Calendar ID (default: primary)" }
             }
-        }
+        },
+        "annotations": read_only_annotation("Meeting Prep")
     }));
     tools.push(json!({
         "name": "workflow_email_to_task",
@@ -388,7 +577,8 @@ fn append_workflow_tools(tools: &mut Vec<Value>) {
                 "tasklist": { "type": "string", "description": "Task list ID" }
             },
             "required": ["message_id"]
-        }
+        },
+        "annotations": mutation_annotation("Email to Task", false)
     }));
     tools.push(json!({
         "name": "workflow_weekly_digest",
@@ -398,7 +588,8 @@ fn append_workflow_tools(tools: &mut Vec<Value>) {
             "properties": {
                 "format": { "type": "string", "description": "Output format" }
             }
-        }
+        },
+        "annotations": read_only_annotation("Weekly Digest")
     }));
     tools.push(json!({
         "name": "workflow_file_announce",
@@ -411,7 +602,8 @@ fn append_workflow_tools(tools: &mut Vec<Value>) {
                 "message": { "type": "string", "description": "Custom message" }
             },
             "required": ["file_id", "space"]
-        }
+        },
+        "annotations": mutation_annotation("File Announce", false)
     }));
 }
 
@@ -471,7 +663,8 @@ fn walk_resources(prefix: &str, resources: &HashMap<String, RestResource>, tools
             tools.push(json!({
                 "name": tool_name,
                 "description": description,
-                "inputSchema": input_schema
+                "inputSchema": input_schema,
+                "annotations": annotation_for_http_method(&method.http_method, &tool_name)
             }));
         }
 
@@ -597,6 +790,61 @@ async fn handle_discover(arguments: &Value, config: &ServerConfig) -> Result<Val
     }))
 }
 
+/// Handle `tool_search` — searches the full tool catalog by keyword/service.
+fn handle_tool_search(arguments: &Value, tools_cache: &Option<Vec<Value>>) -> Result<Value, GwsError> {
+    let query = arguments
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let service_filter = arguments.get("service").and_then(|v| v.as_str());
+
+    let all_tools = match tools_cache {
+        Some(tools) => tools,
+        None => {
+            return Ok(json!({
+                "content": [{ "type": "text", "text": "Tools catalog not yet loaded. Please call tools/list first." }],
+                "isError": true
+            }));
+        }
+    };
+
+    let query_lower = query.to_lowercase();
+    let matches: Vec<&Value> = all_tools
+        .iter()
+        .filter(|tool| {
+            let name = tool["name"].as_str().unwrap_or("");
+            // Skip the tool_search tool itself
+            if name == "tool_search" {
+                return false;
+            }
+            // Filter by service if specified
+            if let Some(svc) = service_filter {
+                if !name.starts_with(&format!("{}_", svc)) && name != svc {
+                    return false;
+                }
+            }
+            // Match query against name and description
+            if query_lower.is_empty() {
+                return service_filter.is_some();
+            }
+            let desc = tool["description"].as_str().unwrap_or("");
+            name.to_lowercase().contains(&query_lower)
+                || desc.to_lowercase().contains(&query_lower)
+        })
+        .take(20)
+        .collect();
+
+    let result = json!({
+        "matchCount": matches.len(),
+        "tools": matches
+    });
+
+    Ok(json!({
+        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+        "isError": false
+    }))
+}
+
 /// Recursively collect all resource paths (dot-separated) from a resource tree.
 fn collect_resource_paths(
     resources: &HashMap<String, RestResource>,
@@ -655,7 +903,11 @@ fn find_resource<'a>(
     Some(current_res)
 }
 
-async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Value, GwsError> {
+async fn handle_tools_call(
+    params: &Value,
+    config: &ServerConfig,
+    tools_cache: &mut Option<Vec<Value>>,
+) -> Result<Value, GwsError> {
     let tool_name = params
         .get("name")
         .and_then(|n| n.as_str())
@@ -668,6 +920,10 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
         return Err(GwsError::Other(anyhow::anyhow!(
             "Workflows are not yet fully implemented via MCP"
         )));
+    }
+
+    if tool_name == "tool_search" {
+        return handle_tool_search(arguments, tools_cache);
     }
 
     if tool_name == "gws_discover" {
@@ -864,12 +1120,25 @@ mod tests {
     use crate::discovery::{MethodParameter, RestDescription, RestMethod, RestResource};
     use std::collections::HashMap;
 
+    fn mock_config(services: Vec<&str>) -> ServerConfig {
+        ServerConfig {
+            services: services.into_iter().map(String::from).collect(),
+            workflows: false,
+            _helpers: false,
+            tool_mode: ToolMode::Full,
+            tool_filter: Vec::new(),
+            page_size: 0,
+        }
+    }
+
     fn mock_config_compact(services: Vec<&str>) -> ServerConfig {
         ServerConfig {
             services: services.into_iter().map(String::from).collect(),
             workflows: false,
             _helpers: false,
             tool_mode: ToolMode::Compact,
+            tool_filter: Vec::new(),
+            page_size: 0,
         }
     }
 
@@ -913,6 +1182,33 @@ mod tests {
                 path: "files/{fileId}".to_string(),
                 description: Some("Gets a file".to_string()),
                 parameters: params,
+                ..Default::default()
+            },
+        );
+        methods.insert(
+            "delete".to_string(),
+            RestMethod {
+                http_method: "DELETE".to_string(),
+                path: "files/{fileId}".to_string(),
+                description: Some("Deletes a file".to_string()),
+                ..Default::default()
+            },
+        );
+        methods.insert(
+            "create".to_string(),
+            RestMethod {
+                http_method: "POST".to_string(),
+                path: "files".to_string(),
+                description: Some("Creates a file".to_string()),
+                ..Default::default()
+            },
+        );
+        methods.insert(
+            "update".to_string(),
+            RestMethod {
+                http_method: "PUT".to_string(),
+                path: "files/{fileId}".to_string(),
+                description: Some("Updates a file".to_string()),
                 ..Default::default()
             },
         );
@@ -1000,6 +1296,228 @@ mod tests {
             resources,
             ..Default::default()
         }
+    }
+
+    fn build_sample_tools() -> Vec<Value> {
+        let mut tools = Vec::new();
+        tools.push(build_tool_search_definition());
+        walk_resources("drive", &mock_doc().resources, &mut tools);
+        walk_resources("gmail", &mock_nested_doc().resources, &mut tools);
+        tools
+    }
+
+    // -- Annotation tests --
+
+    #[test]
+    fn test_read_only_annotation() {
+        let ann = read_only_annotation("Test Tool");
+        assert_eq!(ann["title"], "Test Tool");
+        assert_eq!(ann["readOnlyHint"], true);
+        assert_eq!(ann["destructiveHint"], false);
+        assert_eq!(ann["idempotentHint"], true);
+    }
+
+    #[test]
+    fn test_mutation_annotation() {
+        let ann = mutation_annotation("Mutate Tool", true);
+        assert_eq!(ann["title"], "Mutate Tool");
+        assert_eq!(ann["readOnlyHint"], false);
+        assert_eq!(ann["destructiveHint"], true);
+        assert_eq!(ann["idempotentHint"], false);
+    }
+
+    #[test]
+    fn test_annotation_for_get_method() {
+        let ann = annotation_for_http_method("GET", "drive_files_list");
+        assert_eq!(ann["readOnlyHint"], true);
+        assert_eq!(ann["destructiveHint"], false);
+    }
+
+    #[test]
+    fn test_annotation_for_delete_method() {
+        let ann = annotation_for_http_method("DELETE", "drive_files_delete");
+        assert_eq!(ann["readOnlyHint"], false);
+        assert_eq!(ann["destructiveHint"], true);
+    }
+
+    #[test]
+    fn test_annotation_for_post_method() {
+        let ann = annotation_for_http_method("POST", "drive_files_create");
+        assert_eq!(ann["readOnlyHint"], false);
+        assert_eq!(ann["destructiveHint"], false);
+    }
+
+    #[test]
+    fn test_walk_resources_includes_annotations() {
+        let doc = mock_doc();
+        let mut tools = Vec::new();
+        walk_resources("drive", &doc.resources, &mut tools);
+
+        for tool in &tools {
+            assert!(tool.get("annotations").is_some(), "Tool {} missing annotations", tool["name"]);
+        }
+
+        // Check GET method has readOnlyHint
+        let get_tool = tools.iter().find(|t| t["name"] == "drive_files_get").unwrap();
+        assert_eq!(get_tool["annotations"]["readOnlyHint"], true);
+
+        // Check DELETE method has destructiveHint
+        let del_tool = tools.iter().find(|t| t["name"] == "drive_files_delete").unwrap();
+        assert_eq!(del_tool["annotations"]["destructiveHint"], true);
+    }
+
+    // -- tool_search tests --
+
+    #[test]
+    fn test_tool_search_by_keyword() {
+        let tools = build_sample_tools();
+        let cache = Some(tools);
+        let args = json!({"query": "files"});
+        let result = handle_tool_search(&args, &cache).unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert!(parsed["matchCount"].as_u64().unwrap() > 0);
+        // Should match drive_files_* tools
+        let tool_names: Vec<&str> = parsed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(tool_names.iter().any(|n| n.contains("files")));
+    }
+
+    #[test]
+    fn test_tool_search_by_service() {
+        let tools = build_sample_tools();
+        let cache = Some(tools);
+        let args = json!({"query": "list", "service": "gmail"});
+        let result = handle_tool_search(&args, &cache).unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let tool_names: Vec<&str> = parsed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        // All results should be gmail tools
+        for name in &tool_names {
+            assert!(name.starts_with("gmail_"), "Expected gmail tool, got {}", name);
+        }
+    }
+
+    #[test]
+    fn test_tool_search_no_results() {
+        let tools = build_sample_tools();
+        let cache = Some(tools);
+        let args = json!({"query": "zzz_nonexistent_xyz"});
+        let result = handle_tool_search(&args, &cache).unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["matchCount"], 0);
+    }
+
+    #[test]
+    fn test_tool_search_excludes_itself() {
+        let tools = build_sample_tools();
+        let cache = Some(tools);
+        let args = json!({"query": "tool_search"});
+        let result = handle_tool_search(&args, &cache).unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let tool_names: Vec<&str> = parsed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(!tool_names.contains(&"tool_search"));
+    }
+
+    // -- Deferred filter tests --
+
+    #[test]
+    fn test_deferred_filter_only_exposes_meta_tools() {
+        let tools = build_sample_tools();
+        let filter = vec!["deferred".to_string()];
+        let filtered = apply_tool_filter(&tools, &filter);
+        let names: Vec<&str> = filtered.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"tool_search"));
+        // Should not contain any service tools
+        assert!(!names.iter().any(|n| n.starts_with("drive_")));
+        assert!(!names.iter().any(|n| n.starts_with("gmail_")));
+    }
+
+    #[test]
+    fn test_service_filter_only_exposes_matching() {
+        let tools = build_sample_tools();
+        let filter = vec!["drive".to_string()];
+        let filtered = apply_tool_filter(&tools, &filter);
+        let names: Vec<&str> = filtered.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"tool_search"));
+        assert!(names.iter().any(|n| n.starts_with("drive_")));
+        assert!(!names.iter().any(|n| n.starts_with("gmail_")));
+    }
+
+    #[test]
+    fn test_empty_filter_exposes_all() {
+        let tools = build_sample_tools();
+        let filter: Vec<String> = Vec::new();
+        let filtered = apply_tool_filter(&tools, &filter);
+        assert_eq!(filtered.len(), tools.len());
+    }
+
+    // -- Pagination tests --
+
+    #[test]
+    fn test_pagination_first_page() {
+        let tools = build_sample_tools();
+        let params = json!({});
+        let result = paginate_tools(&tools, &params, 3).unwrap();
+        assert_eq!(result["tools"].as_array().unwrap().len(), 3);
+        assert!(result.get("nextCursor").is_some());
+    }
+
+    #[test]
+    fn test_pagination_last_page() {
+        let tools = build_sample_tools();
+        // Encode offset that will get the last few tools
+        let offset = tools.len() - 1;
+        let cursor = BASE64.encode(offset.to_string().as_bytes());
+        let params = json!({"cursor": cursor});
+        let result = paginate_tools(&tools, &params, 3).unwrap();
+        assert_eq!(result["tools"].as_array().unwrap().len(), 1);
+        assert!(result.get("nextCursor").is_none());
+    }
+
+    #[test]
+    fn test_pagination_invalid_cursor() {
+        let tools = build_sample_tools();
+        let params = json!({"cursor": "!!!invalid!!!"});
+        let result = paginate_tools(&tools, &params, 3);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid cursor"));
+    }
+
+    #[test]
+    fn test_no_pagination_default() {
+        let tools = build_sample_tools();
+        let params = json!({});
+        let result = paginate_tools(&tools, &params, 0).unwrap();
+        assert_eq!(result["tools"].as_array().unwrap().len(), tools.len());
+        assert!(result.get("nextCursor").is_none());
+    }
+
+    #[test]
+    fn test_pagination_cursor_beyond_range() {
+        let tools = build_sample_tools();
+        let offset = tools.len() + 10;
+        let cursor = BASE64.encode(offset.to_string().as_bytes());
+        let params = json!({"cursor": cursor});
+        let result = paginate_tools(&tools, &params, 3);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds tool count"));
     }
 
     // -- find_resource tests --
@@ -1138,6 +1656,46 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_cli_tool_filter_default_empty() {
+        let cli = build_mcp_cli();
+        let matches = cli.get_matches_from(vec!["mcp"]);
+        let filter = matches.get_one::<String>("tool-filter").unwrap();
+        assert_eq!(filter, "");
+    }
+
+    #[test]
+    fn test_cli_tool_filter_deferred() {
+        let cli = build_mcp_cli();
+        let matches = cli.get_matches_from(vec!["mcp", "--tool-filter", "deferred"]);
+        let filter = matches.get_one::<String>("tool-filter").unwrap();
+        assert_eq!(filter, "deferred");
+    }
+
+    #[test]
+    fn test_cli_tool_filter_short_flag() {
+        let cli = build_mcp_cli();
+        let matches = cli.get_matches_from(vec!["mcp", "-f", "drive,gmail"]);
+        let filter = matches.get_one::<String>("tool-filter").unwrap();
+        assert_eq!(filter, "drive,gmail");
+    }
+
+    #[test]
+    fn test_cli_page_size_default() {
+        let cli = build_mcp_cli();
+        let matches = cli.get_matches_from(vec!["mcp"]);
+        let size = *matches.get_one::<usize>("page-size").unwrap();
+        assert_eq!(size, 0);
+    }
+
+    #[test]
+    fn test_cli_page_size_custom() {
+        let cli = build_mcp_cli();
+        let matches = cli.get_matches_from(vec!["mcp", "--page-size", "10"]);
+        let size = *matches.get_one::<usize>("page-size").unwrap();
+        assert_eq!(size, 10);
+    }
+
     // -- append_workflow_tools tests --
 
     #[test]
@@ -1147,5 +1705,42 @@ mod tests {
         assert_eq!(tools.len(), 5);
         assert_eq!(tools[0]["name"], "workflow_standup_report");
         assert_eq!(tools[4]["name"], "workflow_file_announce");
+    }
+
+    #[test]
+    fn test_workflow_tools_have_annotations() {
+        let mut tools = Vec::new();
+        append_workflow_tools(&mut tools);
+        for tool in &tools {
+            assert!(tool.get("annotations").is_some(), "Tool {} missing annotations", tool["name"]);
+        }
+        // Read-only workflows
+        assert_eq!(tools[0]["annotations"]["readOnlyHint"], true);
+        // Mutation workflow
+        let email_to_task = &tools[2];
+        assert_eq!(email_to_task["name"], "workflow_email_to_task");
+        assert_eq!(email_to_task["annotations"]["readOnlyHint"], false);
+    }
+
+    // -- Initialize capability test --
+
+    #[tokio::test]
+    async fn test_initialize_has_list_changed() {
+        let config = mock_config(vec!["drive"]);
+        let mut cache = None;
+        let result = handle_request("initialize", &json!({}), &config, &mut cache)
+            .await
+            .unwrap();
+        assert_eq!(result["capabilities"]["tools"]["listChanged"], true);
+    }
+
+    // -- tool_search definition test --
+
+    #[test]
+    fn test_tool_search_definition_has_annotations() {
+        let def = build_tool_search_definition();
+        assert_eq!(def["name"], "tool_search");
+        assert!(def.get("annotations").is_some());
+        assert_eq!(def["annotations"]["readOnlyHint"], true);
     }
 }
