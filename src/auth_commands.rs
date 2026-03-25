@@ -1015,6 +1015,10 @@ async fn handle_status() -> Result<(), GwsError> {
     };
     output["credential_source"] = json!(credential_source);
 
+    if let Some(user) = crate::auth::get_impersonated_user() {
+        output["impersonated_user"] = json!(user);
+    }
+
     // Try to read and show masked info from encrypted credentials
     // Skip real credential/network access in test builds
     if !cfg!(test) {

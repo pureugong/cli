@@ -57,6 +57,16 @@ pub fn get_quota_project() -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Returns the email address to impersonate via domain-wide delegation, if set.
+///
+/// Reads `GOOGLE_WORKSPACE_CLI_IMPERSONATED_USER`. When present, the service-account
+/// authenticator calls `.subject(email)` so the resulting token acts on behalf of that user.
+pub fn get_impersonated_user() -> Option<String> {
+    std::env::var("GOOGLE_WORKSPACE_CLI_IMPERSONATED_USER")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 /// Returns the well-known Application Default Credentials path:
 /// `~/.config/gcloud/application_default_credentials.json`.
 ///
@@ -200,9 +210,13 @@ async fn get_token_inner(
                 .map(|f| f.to_string_lossy().to_string())
                 .unwrap_or_else(|| "token_cache.json".to_string());
             let sa_cache = token_cache_path.with_file_name(format!("sa_{tc_filename}"));
-            let builder = yup_oauth2::ServiceAccountAuthenticator::builder(key).with_storage(
+            let mut builder = yup_oauth2::ServiceAccountAuthenticator::builder(key).with_storage(
                 Box::new(crate::token_storage::EncryptedTokenStorage::new(sa_cache)),
             );
+
+            if let Some(subject) = get_impersonated_user() {
+                builder = builder.subject(subject);
+            }
 
             let auth = builder
                 .build()
@@ -871,5 +885,30 @@ mod tests {
         let _config_guard = EnvVarGuard::remove("GOOGLE_WORKSPACE_CLI_CONFIG_DIR");
 
         assert_eq!(get_quota_project(), Some("my-project-123".to_string()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_get_impersonated_user_returns_env_value() {
+        let _guard =
+            EnvVarGuard::set("GOOGLE_WORKSPACE_CLI_IMPERSONATED_USER", "admin@example.com");
+        assert_eq!(
+            get_impersonated_user(),
+            Some("admin@example.com".to_string())
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_get_impersonated_user_returns_none_when_unset() {
+        let _guard = EnvVarGuard::remove("GOOGLE_WORKSPACE_CLI_IMPERSONATED_USER");
+        assert_eq!(get_impersonated_user(), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_get_impersonated_user_returns_none_when_empty() {
+        let _guard = EnvVarGuard::set("GOOGLE_WORKSPACE_CLI_IMPERSONATED_USER", "");
+        assert_eq!(get_impersonated_user(), None);
     }
 }
